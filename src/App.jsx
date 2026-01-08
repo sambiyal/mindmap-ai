@@ -34,28 +34,23 @@ const COLORS = {
 };
 
 // --- API CONFIGURATION ---
-// SECURITY: We access the key from the Environment Variable.
-// This keeps the key out of your source code repository.
-// Note: In a browser-only app, the key is still visible in network requests.
-// You MUST configure "Referrer Restrictions" in Google Cloud Console to secure it.
-let apiKey = "";
-try {
-  apiKey = import.meta.env.VITE_GEMINI_API_KEY || "";
-} catch (e) {
-  // Fallback for environments where import.meta might be undefined (unlikely in Vite)
-  console.warn("Environment variables not accessible.");
-}
+// SECURITY NOTE: No API Key or System Prompts are stored here.
+// All logic is handled by /functions/api/gemini.js
 
-// --- Gemini API Helpers ---
+// --- Gemini API Helpers (Via Proxy) ---
 
-const fetchGemini = async (payload, type = 'text') => {
-  if (!apiKey) {
-    throw new Error("MISSING_KEY");
-  }
-
-  const model = type === 'tts' ? 'gemini-2.5-flash-preview-tts' : 'gemini-2.5-flash-preview-09-2025';
-  const url = `https://generativelanguage.googleapis.com/v1beta/models/${model}:generateContent?key=${apiKey}`;
+const fetchGeminiProxy = async (payload, type = 'text') => {
+  // Point to the Cloudflare Function we created
+  const url = `/api/gemini`; 
   
+  const model = type === 'tts' ? 'gemini-2.5-flash-preview-tts' : 'gemini-2.5-flash-preview-09-2025';
+  
+  // We send the payload + the requested model type to our backend
+  const body = {
+    ...payload,
+    model: model
+  };
+
   const delays = [1000, 2000, 4000, 8000, 16000];
   
   for (let i = 0; i <= delays.length; i++) {
@@ -63,10 +58,15 @@ const fetchGemini = async (payload, type = 'text') => {
       const response = await fetch(url, {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify(payload)
+        body: JSON.stringify(body)
       });
 
       if (!response.ok) {
+        // If server returns 500/400, throw specific error
+        if (response.status >= 400 && response.status < 500) {
+             const errData = await response.json();
+             throw new Error(errData.error || "Client Error");
+        }
         if (response.status === 429 && i < delays.length) {
           await new Promise(resolve => setTimeout(resolve, delays[i]));
           continue;
@@ -85,36 +85,8 @@ const fetchGemini = async (payload, type = 'text') => {
 // --- API Functions ---
 
 const callGeminiForAnswer = async (query, contextText) => {
-  const systemPrompt = `
-  You are a strict research assistant and mind map generator.
+  // NOTE: System Prompt is NOT here. It is injected on the server.
   
-  CRITICAL INSTRUCTION: 
-  You must answer ONLY using the provided "Source Material/Context". 
-  Do NOT use outside knowledge, general internet knowledge, or training data to fill in gaps.
-  
-  RULES:
-  1. Search the "Source Material" for the answer.
-  2. If the answer is present, formulate the response based ONLY on that text.
-  3. If the answer is NOT in the "Source Material", explicitly state: "The provided source document does not contain information about [topic]." and do not generate a mind map for that specific missing part.
-  
-  You MUST return a valid JSON object with exactly two keys:
-  1. "text": A natural language answer derived STRICTLY from the source.
-  2. "mindMap": A hierarchical object for visualization.
-     The "mindMap" object must have:
-     - "id": string (unique)
-     - "label": string (display text)
-     - "type": "root" | "child" | "code"
-     - "children": array of node objects (recursive structure).
-  
-  MIND MAP STYLE GUIDE:
-  - **Concepts**: Keep labels short (max 3-4 words).
-  - **Commands/Code**: 
-    - When identifying commands, tools, or syntax from the text, you MUST copy the command string EXACTLY as it appears in the source.
-    - **VERBATIM COPYING IS REQUIRED FOR COMMANDS.** Do not fix typos, do not shorten, do not change flags.
-    - Set the node "type" to "code".
-    - Structure: Create a specific branch for the tool (e.g., "Rubeus"), then a child node of type "code" with the full command string found in the text.
-  `;
-
   const userPrompt = `
   --- SOURCE MATERIAL / CONTEXT ---
   ${contextText ? contextText.substring(0, 30000) : "No source material provided."}
@@ -125,26 +97,20 @@ const callGeminiForAnswer = async (query, contextText) => {
   Answer based STRICTLY on the source material above:
   `;
 
+  // We only send the user prompt. The system instructions are added in the backend.
   const payload = {
     contents: [{ parts: [{ text: userPrompt }] }],
-    systemInstruction: { parts: [{ text: systemPrompt }] },
     generationConfig: { responseMimeType: "application/json" }
   };
 
   try {
-    const result = await fetchGemini(payload, 'text');
+    const result = await fetchGeminiProxy(payload, 'text');
     const jsonText = result.candidates?.[0]?.content?.parts?.[0]?.text;
     return JSON.parse(jsonText);
   } catch (e) {
-    if (e.message === "MISSING_KEY") {
-      return {
-        text: "Configuration Error: API Key is missing. Please check your Cloudflare Environment Variables.",
-        mindMap: null
-      };
-    }
     console.error("Gemini Text Error", e);
     return {
-      text: "I'm sorry, I couldn't generate a response at this moment. Please try again.",
+      text: "I'm sorry, I couldn't generate a response. Please ensure the backend is configured correctly.",
       mindMap: null
     };
   }
@@ -164,17 +130,16 @@ const callGeminiTTS = async (text) => {
   };
 
   try {
-    const result = await fetchGemini(payload, 'tts');
+    const result = await fetchGeminiProxy(payload, 'tts');
     const audioData = result.candidates?.[0]?.content?.parts?.[0]?.inlineData?.data;
     if (audioData) {
-      // Decode base64 to blob
       const binaryString = window.atob(audioData);
       const len = binaryString.length;
       const bytes = new Uint8Array(len);
       for (let i = 0; i < len; i++) {
         bytes[i] = binaryString.charCodeAt(i);
       }
-      return new Blob([bytes], { type: 'audio/wav' }); // Gemini TTS returns raw PCM/WAV friendly data
+      return new Blob([bytes], { type: 'audio/wav' });
     }
     return null;
   } catch (e) {
@@ -184,13 +149,11 @@ const callGeminiTTS = async (text) => {
 };
 
 const callGeminiSummarize = async (text) => {
-  if (!apiKey) return "Error: API Key missing.";
-  
   const payload = {
     contents: [{ parts: [{ text: `Summarize the following text into 3-4 distinct bullet points of key takeaways:\n\n${text.substring(0, 10000)}` }] }]
   };
   try {
-    const result = await fetchGemini(payload, 'text');
+    const result = await fetchGeminiProxy(payload, 'text');
     return result.candidates?.[0]?.content?.parts?.[0]?.text;
   } catch (e) {
     return "Could not generate summary.";
@@ -273,26 +236,19 @@ const MindMapNode = ({ node, x, y, onToggle }) => {
 const MindMapRenderer = ({ data }) => {
   const [collapsed, setCollapsed] = useState(new Set());
 
-  // Reset collapsed state when data changes (new mind map generated)
   useEffect(() => {
     const initialCollapsed = new Set();
-    
-    // Helper to recursively collapse all non-root nodes that have children
     const collapseRecursively = (node) => {
       if (node.children && node.children.length > 0) {
-        // If it's not the root node, add to collapsed set
-        // "data" is the root object passed to the component
         if (node.id !== data.id) {
           initialCollapsed.add(node.id);
         }
         node.children.forEach(collapseRecursively);
       }
     };
-
     if (data) {
       collapseRecursively(data);
     }
-    
     setCollapsed(initialCollapsed);
   }, [data]);
 
@@ -308,46 +264,33 @@ const MindMapRenderer = ({ data }) => {
     });
   };
 
-  // Simple Tree Layout Algorithm
-  // Calculates coordinates for a left-to-right tree
   const calculateLayout = (root, collapsedSet) => {
     let nodes = [];
     let edges = [];
-    
-    // Assign levels and vertical index
     const getLeafCount = (node) => {
-      // If collapsed, it counts as 1 leaf (itself)
       if (collapsedSet.has(node.id)) return 1;
       if (!node.children || node.children.length === 0) return 1;
       return node.children.reduce((acc, child) => acc + getLeafCount(child), 0);
     };
 
-    // Second Pass: Assign X, Y
     let currentLeafY = 0;
-    const X_GAP = 300; // Increased gap for wider code nodes
+    const X_GAP = 300;
     const Y_GAP = 80;
 
     const assignCoords = (node, depth) => {
       const isCollapsed = collapsedSet.has(node.id);
-      // Clone node to avoid mutation issues & attach collapsed state
       const processedNode = { ...node, depth, isCollapsed };
       
-      // Check if node is code to potentially adjust layout (optional, currently just handled by dynamic rendering)
-
-      // If it's collapsed OR has no children, position it as a leaf/terminal node
       if (isCollapsed || !processedNode.children || processedNode.children.length === 0) {
-        processedNode.x = depth * X_GAP + 100; // Offset start
+        processedNode.x = depth * X_GAP + 100;
         processedNode.y = currentLeafY * Y_GAP + 50;
         currentLeafY++;
         return processedNode;
       }
 
-      // Process children first to center parent
       processedNode.children = processedNode.children.map(child => assignCoords(child, depth + 1));
-      
       const firstChildY = processedNode.children[0].y;
       const lastChildY = processedNode.children[processedNode.children.length - 1].y;
-      
       processedNode.x = depth * X_GAP + 100;
       processedNode.y = (firstChildY + lastChildY) / 2;
       return processedNode;
@@ -355,30 +298,25 @@ const MindMapRenderer = ({ data }) => {
 
     const layoutRoot = assignCoords(JSON.parse(JSON.stringify(root)), 0); 
 
-    // Flatten for rendering
     const collect = (node) => {
-      // Calculate effective width for edge connection points
       const isCode = node.type === 'code';
       const charWidth = isCode ? 7.5 : 7;
       const width = Math.max(140, (node.label.length * charWidth) + 30);
       const halfWidth = width / 2;
-
-      // Store halfwidth for edge drawing
       node.halfWidth = halfWidth;
       nodes.push(node);
 
       if (!node.isCollapsed && node.children) {
         node.children.forEach(child => {
-          // Calculate child halfwidth (need to estimate here or pass it back up, simple estimation suffices)
           const childIsCode = child.type === 'code';
           const childCharWidth = childIsCode ? 7.5 : 7;
           const childWidth = Math.max(140, (child.label.length * childCharWidth) + 30);
           const childHalfWidth = childWidth / 2;
 
           edges.push({
-            x1: node.x + halfWidth, // Right edge of parent
+            x1: node.x + halfWidth, 
             y1: node.y,
-            x2: child.x - childHalfWidth, // Left edge of child
+            x2: child.x - childHalfWidth, 
             y2: child.y
           });
           collect(child);
@@ -387,15 +325,11 @@ const MindMapRenderer = ({ data }) => {
     };
     collect(layoutRoot);
     
-    // Determine canvas size
     const maxX = nodes.reduce((max, n) => Math.max(max, n.x + (n.halfWidth || 70)), 0);
     const maxY = nodes.reduce((max, n) => Math.max(max, n.y), 0);
 
     return { 
-        nodes, 
-        edges, 
-        width: Math.max(800, maxX + 200), 
-        height: Math.max(600, maxY + 200) 
+        nodes, edges, width: Math.max(800, maxX + 200), height: Math.max(600, maxY + 200) 
     };
   };
 
@@ -407,7 +341,6 @@ const MindMapRenderer = ({ data }) => {
         <p>Interactive Mind Map • Code nodes show full commands</p>
       </div>
       <svg width={width} height={height} className="mx-auto my-auto min-w-full min-h-full transition-all duration-500 ease-in-out">
-        {/* Edges */}
         {edges.map((edge, i) => (
           <path
             key={`edge-${i}`}
@@ -418,8 +351,6 @@ const MindMapRenderer = ({ data }) => {
             className="transition-all duration-500"
           />
         ))}
-
-        {/* Nodes */}
         {nodes.map((node) => (
           <MindMapNode key={node.id} node={node} x={node.x} y={node.y} onToggle={handleToggle} />
         ))}
@@ -443,20 +374,18 @@ const ChatMessage = ({ message, onGenerateMindMap }) => {
       setIsPlaying(false);
       return;
     }
-
     if (audioUrl) {
       audioRef.current.play();
       setIsPlaying(true);
       return;
     }
-
     setIsLoadingAudio(true);
+    // Calls the proxy function
     const blob = await callGeminiTTS(message.content);
     if (blob) {
       const url = URL.createObjectURL(blob);
       setAudioUrl(url);
       setIsLoadingAudio(false);
-      // Need short delay for ref to update with src
       setTimeout(() => {
         if(audioRef.current) {
             audioRef.current.play();
@@ -471,12 +400,9 @@ const ChatMessage = ({ message, onGenerateMindMap }) => {
   return (
     <div className={`flex w-full mb-6 ${isUser ? 'justify-end' : 'justify-start'}`}>
       <div className={`flex max-w-[85%] ${isUser ? 'flex-row-reverse' : 'flex-row'}`}>
-        {/* Avatar */}
         <div className={`flex-shrink-0 w-8 h-8 rounded-full flex items-center justify-center mt-1 mx-2 ${isUser ? 'bg-indigo-600' : 'bg-emerald-500'}`}>
           {isUser ? <User size={16} className="text-white" /> : <Sparkles size={16} className="text-white" />}
         </div>
-
-        {/* Bubble */}
         <div className={`flex flex-col ${isUser ? 'items-end' : 'items-start'}`}>
           <div className={`px-4 py-3 rounded-2xl text-sm leading-relaxed shadow-sm ${
             isUser 
@@ -484,8 +410,6 @@ const ChatMessage = ({ message, onGenerateMindMap }) => {
               : 'bg-white border border-slate-200 text-slate-700 rounded-tl-none'
           }`}>
             {message.content}
-            
-            {/* Audio Player Element */}
             <audio 
                 ref={audioRef} 
                 src={audioUrl || ""} 
@@ -493,8 +417,6 @@ const ChatMessage = ({ message, onGenerateMindMap }) => {
                 className="hidden"
             />
           </div>
-          
-          {/* Action Area (Only for AI) */}
           {!isUser && (
             <div className="flex gap-2 mt-2">
                 {message.mindMapData && (
@@ -506,7 +428,6 @@ const ChatMessage = ({ message, onGenerateMindMap }) => {
                     Generate Mindmap
                     </button>
                 )}
-                
                 <button
                     onClick={handlePlayAudio}
                     className="flex items-center gap-2 px-3 py-1.5 bg-slate-50 text-slate-600 text-xs font-semibold rounded-full hover:bg-slate-100 transition-colors border border-slate-200"
@@ -525,10 +446,10 @@ const ChatMessage = ({ message, onGenerateMindMap }) => {
 
 // 3. Main App Layout
 export default function MindMapApp() {
-  const [activeTab, setActiveTab] = useState('chat'); // 'chat' | 'knowledge'
+  const [activeTab, setActiveTab] = useState('chat');
   const [sourceText, setSourceText] = useState('');
   const [messages, setMessages] = useState([
-    { id: 1, role: 'system', content: 'Hello! I am your AI research assistant powered by Gemini 2.5. Upload a PDF or paste notes in the "Knowledge Base" tab, then ask me anything.' }
+    { id: 1, role: 'system', content: 'Hello! I am your AI research assistant. Upload a PDF or paste notes in the "Knowledge Base" tab, then ask me anything.' }
   ]);
   const [currentQuery, setCurrentQuery] = useState('');
   const [isTyping, setIsTyping] = useState(false);
@@ -538,7 +459,6 @@ export default function MindMapApp() {
   const messagesEndRef = useRef(null);
   const fileInputRef = useRef(null);
 
-  // Auto-scroll chat
   useEffect(() => {
     messagesEndRef.current?.scrollIntoView({ behavior: 'smooth' });
   }, [messages, isTyping]);
@@ -551,7 +471,7 @@ export default function MindMapApp() {
     setCurrentQuery('');
     setIsTyping(true);
 
-    // Call Real Gemini API
+    // Call Proxy Function
     const response = await callGeminiForAnswer(userMsg.content, sourceText);
     
     const aiMsg = { 
@@ -568,7 +488,6 @@ export default function MindMapApp() {
   const handleFileUpload = (e) => {
     const file = e.target.files[0];
     if (file) {
-      // Simulate reading file (in real app, use PDF.js)
       const reader = new FileReader();
       reader.onload = (e) => {
         const text = e.target.result;
@@ -589,13 +508,10 @@ export default function MindMapApp() {
 
   return (
     <div className="flex h-screen w-full bg-slate-100 font-sans text-slate-800 overflow-hidden">
-      
-      {/* Sidebar Navigation */}
       <div className="w-16 bg-slate-900 flex flex-col items-center py-6 gap-6 z-20 shadow-xl">
         <div className="w-10 h-10 bg-indigo-500 rounded-xl flex items-center justify-center shadow-lg shadow-indigo-500/30">
           <BrainCircuit className="text-white" size={24} />
         </div>
-        
         <div className="flex-1 flex flex-col gap-4 mt-8">
           <button 
             onClick={() => { setActiveTab('chat'); setActiveMindMap(null); }}
@@ -604,7 +520,6 @@ export default function MindMapApp() {
           >
             <MessageSquare size={20} />
           </button>
-          
           <button 
             onClick={() => setActiveTab('knowledge')}
             className={`p-3 rounded-xl transition-all ${activeTab === 'knowledge' ? 'bg-slate-800 text-indigo-400' : 'text-slate-400 hover:text-white'}`}
@@ -615,13 +530,8 @@ export default function MindMapApp() {
         </div>
       </div>
 
-      {/* Main Content Area */}
       <div className="flex-1 flex relative">
-        
-        {/* Left Panel: Chat or Knowledge */}
         <div className={`flex flex-col h-full bg-white transition-all duration-300 border-r border-slate-200 ${activeMindMap ? 'w-1/3' : 'w-full max-w-3xl mx-auto border-x'}`}>
-          
-          {/* Header */}
           <div className="h-16 border-b border-slate-100 flex items-center px-6 justify-between shrink-0">
             <h2 className="font-semibold text-lg text-slate-800 flex items-center gap-2">
               {activeTab === 'chat' ? 'Gemini Assistant' : 'Knowledge Base'}
@@ -634,32 +544,26 @@ export default function MindMapApp() {
             )}
           </div>
 
-          {/* Content Body */}
           <div className="flex-1 overflow-hidden relative">
-            
-            {/* TAB: Knowledge Base */}
             {activeTab === 'knowledge' && (
               <div className="h-full flex flex-col p-6">
                 <div className="mb-4 p-4 bg-indigo-50 rounded-lg border border-indigo-100 flex items-start gap-3">
                   <div className="mt-1 text-indigo-500"><UploadCloud size={20}/></div>
                   <div className="text-sm text-indigo-900">
                     <p className="font-semibold">Contextual Knowledge</p>
-                    <p className="opacity-80 mt-1">Paste your notes or upload files. Gemini will use this content to answer your questions and generate mind maps.</p>
+                    <p className="opacity-80 mt-1">Paste your notes or upload files.</p>
                   </div>
                 </div>
-
-                {/* --- PRIVACY WARNING --- */}
                 <div className="mb-4 px-4 py-3 bg-amber-50 rounded-lg border border-amber-200 flex items-start gap-3">
                   <div className="mt-0.5 text-amber-500"><ShieldAlert size={18}/></div>
                   <div className="text-xs text-amber-900">
                     <p className="font-bold">Privacy Note:</p>
                     <p className="opacity-90 leading-relaxed">
                       Content uploaded here is sent to Google's AI for processing. 
-                      <b> Do not upload</b> highly sensitive personal data, passwords, or financial information.
+                      <b> Do not upload</b> highly sensitive personal data.
                     </p>
                   </div>
                 </div>
-                
                 <div className="flex items-center justify-between mb-4">
                   <div className="flex items-center gap-2">
                     <button 
@@ -677,7 +581,6 @@ export default function MindMapApp() {
                         accept=".txt,.md,.pdf" 
                     />
                   </div>
-                  
                   {sourceText && (
                       <button 
                         onClick={handleSummarize}
@@ -689,7 +592,6 @@ export default function MindMapApp() {
                       </button>
                   )}
                 </div>
-
                 <textarea
                   className="flex-1 w-full p-4 rounded-lg border border-slate-200 resize-none focus:outline-none focus:ring-2 focus:ring-indigo-500/20 font-mono text-sm leading-relaxed"
                   placeholder="Paste your knowledge text here..."
@@ -699,7 +601,6 @@ export default function MindMapApp() {
               </div>
             )}
 
-            {/* TAB: Chat */}
             {activeTab === 'chat' && (
               <div className="h-full flex flex-col">
                 <div className="flex-1 overflow-y-auto p-6 scroll-smooth">
@@ -718,8 +619,6 @@ export default function MindMapApp() {
                   )}
                   <div ref={messagesEndRef} />
                 </div>
-
-                {/* Input Area */}
                 <div className="p-4 border-t border-slate-100 bg-white">
                   <div className="relative flex items-center">
                     <input
@@ -744,10 +643,8 @@ export default function MindMapApp() {
           </div>
         </div>
 
-        {/* Right Panel: Mind Map Visualization (Conditionally Rendered) */}
         {activeMindMap && (
           <div className="flex-1 h-full bg-slate-50 relative animate-in fade-in slide-in-from-right-10 duration-300">
-            {/* Toolbar */}
             <div className="absolute top-4 right-4 flex gap-2 z-10">
               <button 
                 onClick={() => setActiveMindMap(null)}
@@ -756,26 +653,21 @@ export default function MindMapApp() {
                 <X size={20} />
               </button>
             </div>
-
-            {/* Canvas */}
             <div className="w-full h-full">
               <MindMapRenderer data={activeMindMap} />
             </div>
-            
-            {/* Legend/Info */}
             <div className="absolute bottom-6 right-6 max-w-xs bg-white/90 backdrop-blur p-4 rounded-xl shadow-lg border border-slate-200 pointer-events-none">
               <h4 className="font-semibold text-slate-800 text-sm mb-2 flex items-center gap-2">
                 <Layout size={14} /> 
                 Visualization Mode
               </h4>
               <p className="text-xs text-slate-500 leading-relaxed">
-                This mind map is dynamically generated by Gemini from your answer structure. Dark nodes indicate <b>commands</b> or code snippets.
+                This mind map is dynamically generated by Gemini. Dark nodes indicate <b>commands</b> or code snippets.
               </p>
             </div>
           </div>
         )}
         
-        {/* Empty State for Right Panel (if width allows) */}
         {!activeMindMap && (
           <div className="hidden lg:flex flex-1 items-center justify-center bg-slate-50/50">
              <div className="text-center p-8 opacity-40">
@@ -785,7 +677,6 @@ export default function MindMapApp() {
              </div>
           </div>
         )}
-
       </div>
     </div>
   );
