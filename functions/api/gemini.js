@@ -1,3 +1,5 @@
+// --- START OF GEMINI.JS CODE ---
+
 const MINDMAP_SYSTEM_PROMPT = `
   You are a strict research assistant and mind map generator.
   
@@ -43,14 +45,31 @@ export async function onRequestPost(context) {
     // 2. Get the user's request data
     const requestData = await context.request.json();
 
+    // --- SERVER SIDE VALIDATION START ---
+    // Strict check for allowed file extensions based on metadata sent from client
+    if (requestData.filename) {
+      const allowedExtensions = ['.pdf', '.txt'];
+      const lowerFilename = requestData.filename.toLowerCase();
+      const isValid = allowedExtensions.some(ext => lowerFilename.endsWith(ext));
+
+      if (!isValid) {
+        return new Response(JSON.stringify({ 
+          error: "Security Error: Invalid file type. Only .pdf and .txt files are allowed." 
+        }), {
+          status: 400, // Bad Request
+          headers: { "Content-Type": "application/json" },
+        });
+      }
+    }
+    // --- SERVER SIDE VALIDATION END ---
+
     // 3. Determine which model to use
     const model = requestData.model || 'gemini-2.5-flash-preview-09-2025';
     
-    // Clean up the payload before sending to Google (remove custom fields like 'model')
-    const { model: _, ...googlePayload } = requestData;
+    // Clean up the payload before sending to Google (remove custom fields)
+    const { model: _, filename: __, ...googlePayload } = requestData;
 
     // 4. Inject System Instructions (Only for Text Generation Model)
-    // We do NOT inject this for TTS models as it might confuse the audio generation.
     if (model === 'gemini-2.5-flash-preview-09-2025') {
        googlePayload.systemInstruction = {
           parts: [{ text: MINDMAP_SYSTEM_PROMPT }]
@@ -81,3 +100,5 @@ export async function onRequestPost(context) {
     });
   }
 }
+
+// --- END OF GEMINI.JS CODE ---

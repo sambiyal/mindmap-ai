@@ -1,4 +1,5 @@
 import React, { useState, useEffect, useRef, useMemo } from 'react';
+// REMOVED: import * as pdfjsLib from 'pdfjs-dist'; (Using CDN version)
 import { 
   Send, 
   Paperclip, 
@@ -17,7 +18,8 @@ import {
   StopCircle,
   Terminal,
   ShieldAlert,
-  AlertTriangle
+  AlertTriangle,
+  File
 } from 'lucide-react';
 
 // --- Styles & Constants ---
@@ -33,22 +35,16 @@ const COLORS = {
   line: '#cbd5e1'
 };
 
-// --- API CONFIGURATION ---
-// SECURITY NOTE: No API Key or System Prompts are stored here.
-// All logic is handled by /functions/api/gemini.js
-
 // --- Gemini API Helpers (Via Proxy) ---
-
-const fetchGeminiProxy = async (payload, type = 'text') => {
-  // Point to the Cloudflare Function we created
+const fetchGeminiProxy = async (payload, type = 'text', filename = null) => {
   const url = `/api/gemini`; 
-  
   const model = type === 'tts' ? 'gemini-2.5-flash-preview-tts' : 'gemini-2.5-flash-preview-09-2025';
   
-  // We send the payload + the requested model type to our backend
-  const body = {
-    ...payload,
-    model: model
+  // We attach the filename to the body so the server can verify the extension
+  const body = { 
+    ...payload, 
+    model: model,
+    filename: filename 
   };
 
   const delays = [1000, 2000, 4000, 8000, 16000];
@@ -62,7 +58,7 @@ const fetchGeminiProxy = async (payload, type = 'text') => {
       });
 
       if (!response.ok) {
-        // If server returns 500/400, throw specific error
+        // If server returns 500/400, throw specific error (e.g., "Invalid file type")
         if (response.status >= 400 && response.status < 500) {
              const errData = await response.json();
              throw new Error(errData.error || "Client Error");
@@ -73,23 +69,25 @@ const fetchGeminiProxy = async (payload, type = 'text') => {
         }
         throw new Error(`API Error: ${response.status}`);
       }
-
       const data = await response.json();
       return data;
     } catch (error) {
+      // ERROR HANDLING FIX: Detect environment issues (Preview/Blob URLs)
+      if (error.message && (error.message.includes("Failed to parse URL") || error.name === 'TypeError')) {
+         console.warn("Backend fetch failed. This is expected in the preview environment (blob URL) but will work when deployed to Cloudflare.");
+         if (i === delays.length) throw new Error("Environment Limitation: This app requires a backend (Cloudflare Functions). It will not work in this preview. Please deploy to Cloudflare to test.");
+      }
+      
       if (i === delays.length) throw error;
     }
   }
 };
 
 // --- API Functions ---
-
-const callGeminiForAnswer = async (query, contextText) => {
-  // NOTE: System Prompt is NOT here. It is injected on the server.
-  
+const callGeminiForAnswer = async (query, contextText, filename) => {
   const userPrompt = `
   --- SOURCE MATERIAL / CONTEXT ---
-  ${contextText ? contextText.substring(0, 30000) : "No source material provided."}
+  ${contextText ? contextText.substring(0, 50000) : "No source material provided."}
   ---------------------------------
 
   User Question: ${query}
@@ -97,20 +95,28 @@ const callGeminiForAnswer = async (query, contextText) => {
   Answer based STRICTLY on the source material above:
   `;
 
-  // We only send the user prompt. The system instructions are added in the backend.
   const payload = {
     contents: [{ parts: [{ text: userPrompt }] }],
     generationConfig: { responseMimeType: "application/json" }
   };
 
   try {
-    const result = await fetchGeminiProxy(payload, 'text');
+    const result = await fetchGeminiProxy(payload, 'text', filename);
     const jsonText = result.candidates?.[0]?.content?.parts?.[0]?.text;
     return JSON.parse(jsonText);
   } catch (e) {
     console.error("Gemini Text Error", e);
+    // Return error message to chat if validation fails
+    let errorMessage = "I'm sorry, I couldn't generate a response. Please ensure the backend is configured correctly.";
+    
+    if (e.message.includes("Invalid file type")) {
+        errorMessage = "Error: The server rejected this request because the file type is invalid. Only .pdf and .txt are allowed.";
+    } else if (e.message.includes("Environment Limitation")) {
+        errorMessage = "PREVIEW ERROR: This application requires a backend server. Please deploy the code to Cloudflare Pages to use the AI features.";
+    }
+
     return {
-      text: "I'm sorry, I couldn't generate a response. Please ensure the backend is configured correctly.",
+      text: errorMessage,
       mindMap: null
     };
   }
@@ -148,12 +154,12 @@ const callGeminiTTS = async (text) => {
   }
 };
 
-const callGeminiSummarize = async (text) => {
+const callGeminiSummarize = async (text, filename) => {
   const payload = {
     contents: [{ parts: [{ text: `Summarize the following text into 3-4 distinct bullet points of key takeaways:\n\n${text.substring(0, 10000)}` }] }]
   };
   try {
-    const result = await fetchGeminiProxy(payload, 'text');
+    const result = await fetchGeminiProxy(payload, 'text', filename);
     return result.candidates?.[0]?.content?.parts?.[0]?.text;
   } catch (e) {
     return "Could not generate summary.";
@@ -167,14 +173,10 @@ const callGeminiSummarize = async (text) => {
 const MindMapNode = ({ node, x, y, onToggle }) => {
   const hasChildren = node.children && node.children.length > 0;
   const isCode = node.type === 'code';
-  
-  // Dynamic width calculation
-  const charWidth = isCode ? 7.5 : 7; // Approx width per char
+  const charWidth = isCode ? 7.5 : 7;
   const padding = 30;
   const minWidth = 140;
   const calculatedWidth = Math.max(minWidth, (node.label.length * charWidth) + padding);
-  
-  // Center offset
   const xOffset = -(calculatedWidth / 2);
 
   return (
@@ -188,7 +190,6 @@ const MindMapNode = ({ node, x, y, onToggle }) => {
         fill={node.type === 'root' ? COLORS.primary : (isCode ? COLORS.codeBg : COLORS.card)}
         stroke={node.type === 'root' ? 'none' : (isCode ? COLORS.codeText : COLORS.primary)}
         strokeWidth={isCode ? 1 : 2}
-        strokeDasharray={isCode ? "0" : "0"}
         className={`shadow-sm transition-all duration-300 ${hasChildren ? 'cursor-pointer hover:stroke-indigo-400' : ''}`}
         filter="drop-shadow(0px 4px 4px rgba(0,0,0,0.05))"
         onClick={(e) => {
@@ -204,11 +205,9 @@ const MindMapNode = ({ node, x, y, onToggle }) => {
           {node.label}
         </div>
       </foreignObject>
-
-      {/* Collapse/Expand Toggle Button */}
       {hasChildren && (
         <g 
-          transform={`translate(${(-xOffset) + 12}, 0)`} // Position relative to dynamic width
+          transform={`translate(${(-xOffset) + 12}, 0)`}
           className="cursor-pointer hover:opacity-80"
           onClick={(e) => {
              e.stopPropagation();
@@ -216,15 +215,7 @@ const MindMapNode = ({ node, x, y, onToggle }) => {
           }}
         >
           <circle cx="0" cy="0" r="10" fill={COLORS.bg} stroke={COLORS.primary} strokeWidth="2" />
-          <text 
-            x="0" 
-            y="3.5" 
-            textAnchor="middle" 
-            fill={COLORS.primary} 
-            fontSize="14" 
-            fontWeight="bold"
-            style={{ select: 'none', userSelect: 'none' }}
-          >
+          <text x="0" y="3.5" textAnchor="middle" fill={COLORS.primary} fontSize="14" fontWeight="bold" style={{ select: 'none', userSelect: 'none' }}>
             {node.isCollapsed ? '+' : '-'}
           </text>
         </g>
@@ -240,26 +231,18 @@ const MindMapRenderer = ({ data }) => {
     const initialCollapsed = new Set();
     const collapseRecursively = (node) => {
       if (node.children && node.children.length > 0) {
-        if (node.id !== data.id) {
-          initialCollapsed.add(node.id);
-        }
+        if (node.id !== data.id) initialCollapsed.add(node.id);
         node.children.forEach(collapseRecursively);
       }
     };
-    if (data) {
-      collapseRecursively(data);
-    }
+    if (data) collapseRecursively(data);
     setCollapsed(initialCollapsed);
   }, [data]);
 
   const handleToggle = (id) => {
     setCollapsed(prev => {
       const next = new Set(prev);
-      if (next.has(id)) {
-        next.delete(id);
-      } else {
-        next.add(id);
-      }
+      if (next.has(id)) next.delete(id); else next.add(id);
       return next;
     });
   };
@@ -267,6 +250,8 @@ const MindMapRenderer = ({ data }) => {
   const calculateLayout = (root, collapsedSet) => {
     let nodes = [];
     let edges = [];
+    
+    // Assign levels and vertical index
     const getLeafCount = (node) => {
       if (collapsedSet.has(node.id)) return 1;
       if (!node.children || node.children.length === 0) return 1;
@@ -328,9 +313,7 @@ const MindMapRenderer = ({ data }) => {
     const maxX = nodes.reduce((max, n) => Math.max(max, n.x + (n.halfWidth || 70)), 0);
     const maxY = nodes.reduce((max, n) => Math.max(max, n.y), 0);
 
-    return { 
-        nodes, edges, width: Math.max(800, maxX + 200), height: Math.max(600, maxY + 200) 
-    };
+    return { nodes, edges, width: Math.max(800, maxX + 200), height: Math.max(600, maxY + 200) };
   };
 
   const { nodes, edges, width, height } = useMemo(() => calculateLayout(data, collapsed), [data, collapsed]);
@@ -342,14 +325,7 @@ const MindMapRenderer = ({ data }) => {
       </div>
       <svg width={width} height={height} className="mx-auto my-auto min-w-full min-h-full transition-all duration-500 ease-in-out">
         {edges.map((edge, i) => (
-          <path
-            key={`edge-${i}`}
-            d={`M ${edge.x1} ${edge.y1} C ${(edge.x1 + edge.x2) / 2} ${edge.y1}, ${(edge.x1 + edge.x2) / 2} ${edge.y2}, ${edge.x2} ${edge.y2}`}
-            stroke={COLORS.line}
-            strokeWidth="2"
-            fill="none"
-            className="transition-all duration-500"
-          />
+          <path key={`edge-${i}`} d={`M ${edge.x1} ${edge.y1} C ${(edge.x1 + edge.x2) / 2} ${edge.y1}, ${(edge.x1 + edge.x2) / 2} ${edge.y2}, ${edge.x2} ${edge.y2}`} stroke={COLORS.line} strokeWidth="2" fill="none" className="transition-all duration-500" />
         ))}
         {nodes.map((node) => (
           <MindMapNode key={node.id} node={node} x={node.x} y={node.y} onToggle={handleToggle} />
@@ -369,29 +345,15 @@ const ChatMessage = ({ message, onGenerateMindMap }) => {
   const audioRef = useRef(null);
 
   const handlePlayAudio = async () => {
-    if (isPlaying) {
-      audioRef.current.pause();
-      setIsPlaying(false);
-      return;
-    }
-    if (audioUrl) {
-      audioRef.current.play();
-      setIsPlaying(true);
-      return;
-    }
+    if (isPlaying) { audioRef.current.pause(); setIsPlaying(false); return; }
+    if (audioUrl) { audioRef.current.play(); setIsPlaying(true); return; }
     setIsLoadingAudio(true);
-    // Calls the proxy function
     const blob = await callGeminiTTS(message.content);
     if (blob) {
       const url = URL.createObjectURL(blob);
       setAudioUrl(url);
       setIsLoadingAudio(false);
-      setTimeout(() => {
-        if(audioRef.current) {
-            audioRef.current.play();
-            setIsPlaying(true);
-        }
-      }, 100);
+      setTimeout(() => { if(audioRef.current) { audioRef.current.play(); setIsPlaying(true); } }, 100);
     } else {
       setIsLoadingAudio(false);
     }
@@ -404,34 +366,18 @@ const ChatMessage = ({ message, onGenerateMindMap }) => {
           {isUser ? <User size={16} className="text-white" /> : <Sparkles size={16} className="text-white" />}
         </div>
         <div className={`flex flex-col ${isUser ? 'items-end' : 'items-start'}`}>
-          <div className={`px-4 py-3 rounded-2xl text-sm leading-relaxed shadow-sm ${
-            isUser 
-              ? 'bg-indigo-600 text-white rounded-tr-none' 
-              : 'bg-white border border-slate-200 text-slate-700 rounded-tl-none'
-          }`}>
+          <div className={`px-4 py-3 rounded-2xl text-sm leading-relaxed shadow-sm ${isUser ? 'bg-indigo-600 text-white rounded-tr-none' : 'bg-white border border-slate-200 text-slate-700 rounded-tl-none'}`}>
             {message.content}
-            <audio 
-                ref={audioRef} 
-                src={audioUrl || ""} 
-                onEnded={() => setIsPlaying(false)}
-                className="hidden"
-            />
+            <audio ref={audioRef} src={audioUrl || ""} onEnded={() => setIsPlaying(false)} className="hidden" />
           </div>
           {!isUser && (
             <div className="flex gap-2 mt-2">
                 {message.mindMapData && (
-                    <button
-                    onClick={() => onGenerateMindMap(message.mindMapData)}
-                    className="flex items-center gap-2 px-3 py-1.5 bg-indigo-50 text-indigo-700 text-xs font-semibold rounded-full hover:bg-indigo-100 transition-colors border border-indigo-200"
-                    >
-                    <Network size={14} />
-                    Generate Mindmap
+                    <button onClick={() => onGenerateMindMap(message.mindMapData)} className="flex items-center gap-2 px-3 py-1.5 bg-indigo-50 text-indigo-700 text-xs font-semibold rounded-full hover:bg-indigo-100 transition-colors border border-indigo-200">
+                    <Network size={14} /> Generate Mindmap
                     </button>
                 )}
-                <button
-                    onClick={handlePlayAudio}
-                    className="flex items-center gap-2 px-3 py-1.5 bg-slate-50 text-slate-600 text-xs font-semibold rounded-full hover:bg-slate-100 transition-colors border border-slate-200"
-                >
+                <button onClick={handlePlayAudio} className="flex items-center gap-2 px-3 py-1.5 bg-slate-50 text-slate-600 text-xs font-semibold rounded-full hover:bg-slate-100 transition-colors border border-slate-200">
                     {isLoadingAudio ? <Loader2 size={14} className="animate-spin"/> : isPlaying ? <StopCircle size={14}/> : <Volume2 size={14} />}
                     {isPlaying ? "Stop" : "Listen"}
                 </button>
@@ -448,6 +394,9 @@ const ChatMessage = ({ message, onGenerateMindMap }) => {
 export default function MindMapApp() {
   const [activeTab, setActiveTab] = useState('chat');
   const [sourceText, setSourceText] = useState('');
+  const [currentFilename, setCurrentFilename] = useState(null); // Track filename for validation
+  const [pdfPreviewUrl, setPdfPreviewUrl] = useState(null);
+  const [isProcessingPdf, setIsProcessingPdf] = useState(false);
   const [messages, setMessages] = useState([
     { id: 1, role: 'system', content: 'Hello! I am your AI research assistant. Upload a PDF or paste notes in the "Knowledge Base" tab, then ask me anything.' }
   ]);
@@ -459,49 +408,115 @@ export default function MindMapApp() {
   const messagesEndRef = useRef(null);
   const fileInputRef = useRef(null);
 
+  // --- Dynamic Script Loading for PDF.js (CDN Fallback) ---
+  useEffect(() => {
+    // Only load if not already present
+    if (!window.pdfjsLib) {
+      const script = document.createElement('script');
+      script.src = 'https://cdnjs.cloudflare.com/ajax/libs/pdf.js/3.11.174/pdf.min.js';
+      script.async = true;
+      script.onload = () => {
+        console.log("PDF.js Library Loaded via CDN");
+        // Set worker src relative to the main library version
+        window.pdfjsLib.GlobalWorkerOptions.workerSrc = 'https://cdnjs.cloudflare.com/ajax/libs/pdf.js/3.11.174/pdf.worker.min.js';
+      };
+      document.body.appendChild(script);
+      return () => {
+        // Cleanup if component unmounts quickly, though usually we want this persistent
+        if (document.body.contains(script)) {
+          document.body.removeChild(script);
+        }
+      };
+    }
+  }, []);
+
   useEffect(() => {
     messagesEndRef.current?.scrollIntoView({ behavior: 'smooth' });
   }, [messages, isTyping]);
 
   const handleSendMessage = async () => {
     if (!currentQuery.trim()) return;
-
     const userMsg = { id: Date.now(), role: 'user', content: currentQuery };
     setMessages(prev => [...prev, userMsg]);
     setCurrentQuery('');
     setIsTyping(true);
-
-    // Call Proxy Function
-    const response = await callGeminiForAnswer(userMsg.content, sourceText);
-    
-    const aiMsg = { 
-        id: Date.now() + 1, 
-        role: 'assistant', 
-        content: response.text,
-        mindMapData: response.mindMap
-    };
-    
+    const response = await callGeminiForAnswer(userMsg.content, sourceText, currentFilename);
+    const aiMsg = { id: Date.now() + 1, role: 'assistant', content: response.text, mindMapData: response.mindMap };
     setMessages(prev => [...prev, aiMsg]);
     setIsTyping(false);
   };
 
-  const handleFileUpload = (e) => {
+  const extractTextFromPdf = async (arrayBuffer) => {
+    // Ensure PDF library is loaded
+    if (!window.pdfjsLib) {
+        throw new Error("PDF Library is still loading. Please wait 2 seconds and try again.");
+    }
+
+    try {
+      const pdf = await window.pdfjsLib.getDocument(arrayBuffer).promise;
+      let fullText = '';
+      for (let i = 1; i <= pdf.numPages; i++) {
+        const page = await pdf.getPage(i);
+        const textContent = await page.getTextContent();
+        const pageText = textContent.items.map(item => item.str).join(' ');
+        fullText += `\n\n--- Page ${i} ---\n${pageText}`;
+      }
+      return fullText;
+    } catch (err) {
+      console.error("PDF Parse Error", err);
+      throw new Error("Failed to extract text from PDF");
+    }
+  };
+
+  const handleFileUpload = async (e) => {
     const file = e.target.files[0];
-    if (file) {
+    if (!file) return;
+
+    // Strict Client-Side Extension Check
+    const allowedExtensions = ['pdf', 'txt'];
+    const fileExtension = file.name.split('.').pop().toLowerCase();
+    
+    if (!allowedExtensions.includes(fileExtension)) {
+      alert("Invalid file type. Only .pdf and .txt files are allowed.");
+      e.target.value = null; // Reset input
+      return;
+    }
+
+    setCurrentFilename(file.name); // Store for server validation
+
+    if (file.type === 'application/pdf' || fileExtension === 'pdf') {
+      setIsProcessingPdf(true);
+      // 1. Create a URL for visual preview (iframe)
+      const url = URL.createObjectURL(file);
+      setPdfPreviewUrl(url);
+      
+      // 2. Extract Text for AI
+      try {
+        const arrayBuffer = await file.arrayBuffer();
+        const extractedText = await extractTextFromPdf(arrayBuffer);
+        setSourceText(prev => prev + `\n\n--- PDF IMPORT: ${file.name} ---\n` + extractedText);
+        setActiveTab('knowledge');
+      } catch (err) {
+        alert("Error reading PDF: " + err.message);
+      } finally {
+        setIsProcessingPdf(false);
+      }
+    } else {
+      // Normal Text/Markdown Handling
       const reader = new FileReader();
       reader.onload = (e) => {
         const text = e.target.result;
         setSourceText(prev => prev + `\n\n--- Imported from ${file.name} ---\n\n` + text);
         setActiveTab('knowledge');
       };
-      reader.readAsText(file); 
+      reader.readAsText(file);
     }
   };
 
   const handleSummarize = async () => {
     if (!sourceText) return;
     setIsSummarizing(true);
-    const summary = await callGeminiSummarize(sourceText);
+    const summary = await callGeminiSummarize(sourceText, currentFilename);
     setSourceText(prev => `*** AI SUMMARY ***\n${summary}\n\n` + prev);
     setIsSummarizing(false);
   }
@@ -513,20 +528,8 @@ export default function MindMapApp() {
           <BrainCircuit className="text-white" size={24} />
         </div>
         <div className="flex-1 flex flex-col gap-4 mt-8">
-          <button 
-            onClick={() => { setActiveTab('chat'); setActiveMindMap(null); }}
-            className={`p-3 rounded-xl transition-all ${activeTab === 'chat' && !activeMindMap ? 'bg-slate-800 text-indigo-400' : 'text-slate-400 hover:text-white'}`}
-            title="Chat"
-          >
-            <MessageSquare size={20} />
-          </button>
-          <button 
-            onClick={() => setActiveTab('knowledge')}
-            className={`p-3 rounded-xl transition-all ${activeTab === 'knowledge' ? 'bg-slate-800 text-indigo-400' : 'text-slate-400 hover:text-white'}`}
-            title="Knowledge Base"
-          >
-            <FileText size={20} />
-          </button>
+          <button onClick={() => { setActiveTab('chat'); setActiveMindMap(null); }} className={`p-3 rounded-xl transition-all ${activeTab === 'chat' && !activeMindMap ? 'bg-slate-800 text-indigo-400' : 'text-slate-400 hover:text-white'}`} title="Chat"><MessageSquare size={20} /></button>
+          <button onClick={() => setActiveTab('knowledge')} className={`p-3 rounded-xl transition-all ${activeTab === 'knowledge' ? 'bg-slate-800 text-indigo-400' : 'text-slate-400 hover:text-white'}`} title="Knowledge Base"><FileText size={20} /></button>
         </div>
       </div>
 
@@ -551,53 +554,46 @@ export default function MindMapApp() {
                   <div className="mt-1 text-indigo-500"><UploadCloud size={20}/></div>
                   <div className="text-sm text-indigo-900">
                     <p className="font-semibold">Contextual Knowledge</p>
-                    <p className="opacity-80 mt-1">Paste your notes or upload files.</p>
+                    <p className="opacity-80 mt-1">Upload .pdf or .txt files only. The server will verify file types.</p>
                   </div>
                 </div>
-                <div className="mb-4 px-4 py-3 bg-amber-50 rounded-lg border border-amber-200 flex items-start gap-3">
-                  <div className="mt-0.5 text-amber-500"><ShieldAlert size={18}/></div>
-                  <div className="text-xs text-amber-900">
-                    <p className="font-bold">Privacy Note:</p>
-                    <p className="opacity-90 leading-relaxed">
-                      Content uploaded here is sent to Google's AI for processing. 
-                      <b> Do not upload</b> highly sensitive personal data.
-                    </p>
-                  </div>
-                </div>
+
                 <div className="flex items-center justify-between mb-4">
                   <div className="flex items-center gap-2">
-                    <button 
-                        onClick={() => fileInputRef.current?.click()}
-                        className="flex items-center gap-2 px-4 py-2 bg-white border border-slate-300 hover:bg-slate-50 text-slate-700 rounded-md text-sm font-medium transition-colors"
-                    >
-                        <Paperclip size={16} />
-                        Upload File
+                    <button onClick={() => fileInputRef.current?.click()} className="flex items-center gap-2 px-4 py-2 bg-white border border-slate-300 hover:bg-slate-50 text-slate-700 rounded-md text-sm font-medium transition-colors">
+                        {isProcessingPdf ? <Loader2 size={16} className="animate-spin"/> : <Paperclip size={16} />}
+                        {isProcessingPdf ? "Extracting..." : "Upload File"}
                     </button>
-                    <input 
-                        type="file" 
-                        ref={fileInputRef} 
-                        className="hidden" 
-                        onChange={handleFileUpload}
-                        accept=".txt,.md,.pdf" 
-                    />
+                    {/* RESTRICTED ACCEPT ATTRIBUTE */}
+                    <input type="file" ref={fileInputRef} className="hidden" onChange={handleFileUpload} accept=".txt,.pdf" />
                   </div>
                   {sourceText && (
-                      <button 
-                        onClick={handleSummarize}
-                        disabled={isSummarizing}
-                        className="flex items-center gap-2 px-4 py-2 bg-indigo-50 text-indigo-700 rounded-md text-sm font-medium hover:bg-indigo-100 transition-colors"
-                      >
+                      <button onClick={handleSummarize} disabled={isSummarizing} className="flex items-center gap-2 px-4 py-2 bg-indigo-50 text-indigo-700 rounded-md text-sm font-medium hover:bg-indigo-100 transition-colors">
                         {isSummarizing ? <Loader2 size={16} className="animate-spin"/> : <Sparkles size={16}/>}
                         {isSummarizing ? "Summarizing..." : "AI Summarize"}
                       </button>
                   )}
                 </div>
-                <textarea
-                  className="flex-1 w-full p-4 rounded-lg border border-slate-200 resize-none focus:outline-none focus:ring-2 focus:ring-indigo-500/20 font-mono text-sm leading-relaxed"
-                  placeholder="Paste your knowledge text here..."
-                  value={sourceText}
-                  onChange={(e) => setSourceText(e.target.value)}
-                />
+
+                <div className="flex-1 flex flex-col gap-4 overflow-hidden">
+                  {/* PDF Preview Area */}
+                  {pdfPreviewUrl && (
+                    <div className="w-full h-1/2 min-h-[300px] border border-slate-200 rounded-lg overflow-hidden bg-slate-50">
+                      <iframe src={pdfPreviewUrl} className="w-full h-full" title="PDF Preview" />
+                    </div>
+                  )}
+                  
+                  {/* Extracted Text Area */}
+                  <div className="flex-1 flex flex-col">
+                    <label className="text-xs font-semibold text-slate-500 mb-2">Extracted Text (AI Context):</label>
+                    <textarea
+                      className="flex-1 w-full p-4 rounded-lg border border-slate-200 resize-none focus:outline-none focus:ring-2 focus:ring-indigo-500/20 font-mono text-sm leading-relaxed"
+                      placeholder="Paste your knowledge text here or upload a PDF..."
+                      value={sourceText}
+                      onChange={(e) => setSourceText(e.target.value)}
+                    />
+                  </div>
+                </div>
               </div>
             )}
 
@@ -605,11 +601,7 @@ export default function MindMapApp() {
               <div className="h-full flex flex-col">
                 <div className="flex-1 overflow-y-auto p-6 scroll-smooth">
                   {messages.map((msg) => (
-                    <ChatMessage 
-                      key={msg.id} 
-                      message={msg} 
-                      onGenerateMindMap={(data) => setActiveMindMap(data)}
-                    />
+                    <ChatMessage key={msg.id} message={msg} onGenerateMindMap={(data) => setActiveMindMap(data)} />
                   ))}
                   {isTyping && (
                     <div className="flex items-center gap-2 text-slate-400 text-sm ml-12">
@@ -629,11 +621,7 @@ export default function MindMapApp() {
                       onChange={(e) => setCurrentQuery(e.target.value)}
                       onKeyDown={(e) => e.key === 'Enter' && handleSendMessage()}
                     />
-                    <button 
-                      onClick={handleSendMessage}
-                      disabled={!currentQuery.trim() || isTyping}
-                      className="absolute right-2 p-2 bg-indigo-600 hover:bg-indigo-700 text-white rounded-full transition-colors disabled:opacity-50 disabled:cursor-not-allowed"
-                    >
+                    <button onClick={handleSendMessage} disabled={!currentQuery.trim() || isTyping} className="absolute right-2 p-2 bg-indigo-600 hover:bg-indigo-700 text-white rounded-full transition-colors disabled:opacity-50 disabled:cursor-not-allowed">
                       {isTyping ? <Loader2 size={18} className="animate-spin" /> : <Send size={18} />}
                     </button>
                   </div>
@@ -646,24 +634,12 @@ export default function MindMapApp() {
         {activeMindMap && (
           <div className="flex-1 h-full bg-slate-50 relative animate-in fade-in slide-in-from-right-10 duration-300">
             <div className="absolute top-4 right-4 flex gap-2 z-10">
-              <button 
-                onClick={() => setActiveMindMap(null)}
-                className="p-2 bg-white/90 backdrop-blur rounded-full shadow-sm hover:bg-slate-100 text-slate-500 transition-colors border border-slate-200"
-              >
-                <X size={20} />
-              </button>
+              <button onClick={() => setActiveMindMap(null)} className="p-2 bg-white/90 backdrop-blur rounded-full shadow-sm hover:bg-slate-100 text-slate-500 transition-colors border border-slate-200"><X size={20} /></button>
             </div>
-            <div className="w-full h-full">
-              <MindMapRenderer data={activeMindMap} />
-            </div>
+            <div className="w-full h-full"><MindMapRenderer data={activeMindMap} /></div>
             <div className="absolute bottom-6 right-6 max-w-xs bg-white/90 backdrop-blur p-4 rounded-xl shadow-lg border border-slate-200 pointer-events-none">
-              <h4 className="font-semibold text-slate-800 text-sm mb-2 flex items-center gap-2">
-                <Layout size={14} /> 
-                Visualization Mode
-              </h4>
-              <p className="text-xs text-slate-500 leading-relaxed">
-                This mind map is dynamically generated by Gemini. Dark nodes indicate <b>commands</b> or code snippets.
-              </p>
+              <h4 className="font-semibold text-slate-800 text-sm mb-2 flex items-center gap-2"><Layout size={14} /> Visualization Mode</h4>
+              <p className="text-xs text-slate-500 leading-relaxed">This mind map is dynamically generated by Gemini.</p>
             </div>
           </div>
         )}
@@ -681,3 +657,5 @@ export default function MindMapApp() {
     </div>
   );
 }
+
+// --- END OF APP.JSX CODE ---
